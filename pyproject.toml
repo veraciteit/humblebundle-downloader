@@ -25,6 +25,7 @@ optional = true
 [tool.poetry.group.macos-gui.dependencies]
 pyobjc-core = "^10.0"
 pyobjc-framework-Cocoa = "^10.0"
+py2app = "^0.28"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.3.2"
