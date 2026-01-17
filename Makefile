@@ -2,13 +2,14 @@
 
 .PHONY: install install-gui build-app build-app-dev clean test
 
-# Install CLI only
+# Install CLI dependencies with pip
 install:
-	poetry install
+	pip install -e .
 
-# Install with macOS GUI support
+# Install with macOS GUI support (pip)
 install-gui:
-	poetry install --with macos-gui
+	pip install -e .
+	pip install pyobjc-core pyobjc-framework-Cocoa py2app
 
 # Build standalone macOS app (production)
 build-app: install-gui
@@ -49,12 +50,12 @@ clean:
 
 # Run tests
 test:
-	poetry run pytest
+	python -m pytest
 
 # Run the GUI directly (without building)
 run-gui: install-gui
-	poetry run hbd-gui
+	python -m humblebundle_downloader.gui
 
 # Run the CLI
 run-cli:
-	poetry run hbd --help
+	hbd --help
