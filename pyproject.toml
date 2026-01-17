@@ -12,11 +12,19 @@ repository = "https://github.com/xtream1101/humblebundle-downloader"
 
 [tool.poetry.scripts]
 hbd = "humblebundle_downloader.cli:cli"
+hbd-gui = "humblebundle_downloader.gui:main"
 
 [tool.poetry.dependencies]
 python = "^3.10"
 requests = "^2.32.3"
 parsel = "^1.9.1"
+
+[tool.poetry.group.macos-gui]
+optional = true
+
+[tool.poetry.group.macos-gui.dependencies]
+pyobjc-core = "^10.0"
+pyobjc-framework-Cocoa = "^10.0"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.3.2"
