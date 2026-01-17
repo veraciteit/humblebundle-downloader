@@ -7,8 +7,45 @@ import logging
 import datetime
 import requests
 import http.cookiejar
+import tempfile
+import socket
+import subprocess
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+# Platform detection
+IS_MACOS = sys.platform == "darwin"
+
+# macOS-optimized constants
+# macOS networking stack performs better with larger buffers
+CHUNK_SIZE = 65536 if IS_MACOS else 8192  # 64KB for macOS, 8KB otherwise
+# Connection pooling settings optimized for macOS
+POOL_CONNECTIONS = 10 if IS_MACOS else 5
+POOL_MAXSIZE = 20 if IS_MACOS else 10
+
+# File locking support for macOS
+if IS_MACOS:
+    import fcntl
+
+
+def _send_macos_notification(title, message, sound=True):
+    """Send a native macOS notification using osascript."""
+    if not IS_MACOS:
+        return
+
+    try:
+        sound_option = 'sound name "default"' if sound else ""
+        script = f'display notification "{message}" with title "{title}" {sound_option}'
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            timeout=5,
+        )
+        logger.debug(f"macOS notification sent: {title}")
+    except Exception as e:
+        logger.debug(f"Failed to send macOS notification: {e}")
 
 
 def _clean_name(dirty_str):
@@ -34,9 +71,11 @@ class DownloadLibrary:
         purchase_keys=None,
         trove=False,
         update=False,
+        notifications=False,
     ):
         self.library_path = library_path
         self.progress_bar = progress_bar
+        self.notifications = notifications and IS_MACOS  # Only enable on macOS
         self.ext_include = (
             [] if ext_include is None else list(map(str.lower, ext_include))
         )
@@ -53,7 +92,7 @@ class DownloadLibrary:
         self.trove = trove
         self.update = update
 
-        self.session = requests.Session()
+        self.session = self._create_optimized_session()
         if cookie_path:
             try:
                 cookie_jar = http.cookiejar.MozillaCookieJar(cookie_path)
@@ -68,12 +107,72 @@ class DownloadLibrary:
                 {"cookie": "_simpleauth_sess={}".format(cookie_auth)}
             )
 
+    def _create_optimized_session(self):
+        """Create an optimized requests session with connection pooling and retry logic."""
+        session = requests.Session()
+
+        # Configure retry strategy with exponential backoff
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST"],
+        )
+
+        # Create adapter with connection pooling
+        adapter = HTTPAdapter(
+            pool_connections=POOL_CONNECTIONS,
+            pool_maxsize=POOL_MAXSIZE,
+            max_retries=retry_strategy,
+        )
+
+        # Mount adapter for both HTTP and HTTPS
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        # macOS-specific socket optimizations
+        if IS_MACOS:
+            self._configure_macos_socket_options(session)
+
+        return session
+
+    def _configure_macos_socket_options(self, session):
+        """Configure macOS-specific socket optimizations for better network performance."""
+        # Store original socket creation function
+        original_socket = socket.socket
+
+        def macos_optimized_socket(*args, **kwargs):
+            sock = original_socket(*args, **kwargs)
+            try:
+                # Enable TCP keepalive for long-running downloads
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # Set larger receive buffer for macOS (256KB)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                # Set larger send buffer for macOS (256KB)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+            except (OSError, AttributeError):
+                # Ignore if socket options cannot be set
+                pass
+            return sock
+
+        # Monkey-patch socket creation for this session's connections
+        socket.socket = macos_optimized_socket
+        logger.debug("macOS socket optimizations enabled")
+
     def start(self):
         self.cache_file = os.path.join(self.library_path, ".cache.json")
         self.cache_data = self._load_cache_data(self.cache_file)
         self.purchase_keys = (
             self.purchase_keys if self.purchase_keys else self._get_purchase_keys()
         )
+        self._download_count = 0  # Track downloads for notifications
+
+        if self.notifications:
+            _send_macos_notification(
+                "Humble Bundle Downloader",
+                "Starting download process...",
+                sound=False,
+            )
 
         if self.trove is True:
             logger.info("Only checking the Humble Trove...")
@@ -83,6 +182,14 @@ class DownloadLibrary:
         else:
             for order_id in self.purchase_keys:
                 self._process_order_id(order_id)
+
+        # Send completion notification
+        if self.notifications and self._download_count > 0:
+            _send_macos_notification(
+                "Humble Bundle Downloader",
+                f"Download complete! {self._download_count} file(s) downloaded.",
+                sound=True,
+            )
 
     def _get_trove_download_url(self, machine_name, web_name):
         try:
@@ -433,8 +540,52 @@ class DownloadLibrary:
         self.cache_data[cache_file_key] = file_info
         # Update cache file with newest data so if the script
         # quits it can keep track of the progress
-        # Note: Only safe because of single thread,
-        # need to change if refactor to multi threading
+        # Use atomic write with file locking on macOS for safety
+        if IS_MACOS:
+            self._atomic_cache_write_macos()
+        else:
+            self._simple_cache_write()
+
+    def _atomic_cache_write_macos(self):
+        """Atomic cache write with file locking for macOS."""
+        cache_dir = os.path.dirname(self.cache_file)
+        try:
+            # Write to a temporary file first
+            fd, temp_path = tempfile.mkstemp(
+                suffix=".json.tmp",
+                prefix=".cache_",
+                dir=cache_dir
+            )
+            try:
+                with os.fdopen(fd, "w") as outfile:
+                    # Acquire exclusive lock on macOS
+                    fcntl.flock(outfile.fileno(), fcntl.LOCK_EX)
+                    try:
+                        json.dump(
+                            self.cache_data,
+                            outfile,
+                            sort_keys=True,
+                            indent=4,
+                        )
+                        outfile.flush()
+                        os.fsync(outfile.fileno())
+                    finally:
+                        fcntl.flock(outfile.fileno(), fcntl.LOCK_UN)
+                # Atomic rename on macOS (POSIX compliant)
+                os.rename(temp_path, self.cache_file)
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            logger.warning("Atomic cache write failed, falling back to simple write")
+            self._simple_cache_write()
+
+    def _simple_cache_write(self):
+        """Simple cache write for non-macOS systems."""
         with open(self.cache_file, "w") as outfile:
             json.dump(
                 self.cache_data,
@@ -544,6 +695,7 @@ class DownloadLibrary:
                     "%a, %d %b %Y %H:%M:%S %Z"
                 )
             self._update_cache_data(cache_file_key, file_info)
+            self._download_count += 1  # Track successful downloads for notifications
 
         finally:
             # Since its a stream connection, make sure to close it
@@ -559,7 +711,7 @@ class DownloadLibrary:
             total_length = product_r.headers.get("content-length")
             if total_length is None:  # no content length header
                 dl = 0
-                for data in product_r.iter_content(chunk_size=4096):
+                for data in product_r.iter_content(chunk_size=CHUNK_SIZE):
                     dl += len(data)
                     outfile.write(data)
                     if self.progress_bar:
@@ -570,7 +722,7 @@ class DownloadLibrary:
             else:
                 dl = 0
                 total_length = int(total_length)
-                for data in product_r.iter_content(chunk_size=4096):
+                for data in product_r.iter_content(chunk_size=CHUNK_SIZE):
                     dl += len(data)
                     outfile.write(data)
                     pb_width = 50

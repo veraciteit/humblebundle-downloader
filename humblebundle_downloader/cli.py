@@ -93,6 +93,12 @@ def parse_args(args):
             "products/bundle download page. Can set multiple"
         ),
     )
+    parser.add_argument(
+        "-n",
+        "--notifications",
+        action="store_true",
+        help="Enable macOS notifications for download progress (macOS only)",
+    )
 
     return parser.parse_args(args)
 
@@ -113,4 +119,5 @@ def cli():
         purchase_keys=cli_args.keys,
         trove=cli_args.trove,
         update=cli_args.update,
+        notifications=cli_args.notifications,
     ).start()
